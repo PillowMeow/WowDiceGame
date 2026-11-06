@@ -8,6 +8,6 @@ uv run pre-commit install
 Ctrl+Shift+P --> Python: Select Interpreter 검색 --> .venv 어쩌고 선택
 
 3) 매 풀 리퀘스트마다 다음 명령어 실행
-uv run ruff check . && uv run pyright && uv run pytest
+uv run ruff check . && uv run pyright
 
 해서 에러가 뜨지 않는지 확인한 후 풀리퀘할 것

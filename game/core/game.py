@@ -1,24 +1,34 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Sequence
 
-from game.core.actions import Action, EndTurn, RollDice, UseActive  # 필요해서 자체적으로 추가
-from game.core.registry import BOARDS
+from game.core.actions import Action, Buy, EndTurn, RollDice, UseActive
+from game.core.log import LogEntry
+from game.core.registry import BOARDS, DICE, SHOP, TILE_KINDS
 from game.core.rng import Rng
-from game.core.state import Board, Die, Phase, Player  # Die 추가함
+from game.core.state import Board, Phase, Player
 
 
-class IllegalAction(Exception): ...
+class IllegalAction(Exception):
+    """지금 할 수 없는 Action. 상태는 바뀌지 않음"""
 
 
 class Game:
     board: Board
-    players: list[Player]  # 2~4명 / 이 리스트의 플레이어 순서가 턴 순서
-    turn: int  # 1부터 세고 모든 플레이어가 턴을 가질 때마다 +1
-    current: int  # 지금 턴을 가지고 있는 플레이어의 인덱스
-    phase: Phase  # 현재 턴 진행 상태
-    rng: Rng  # 게임 전체에서 들고있는 랜덤함수 하나
+    players: list[Player]
+    """2~4명. 이 리스트의 플레이어 순서가 턴 순서"""
+    turn: int
+    """1부터 세고 모든 플레이어가 한 번씩 하면 +1"""
+    current: int
+    """지금 턴을 가지고 있는 플레이어의 인덱스"""
+    phase: Phase
+    rng: Rng
+    """게임 전체에서 들고 있는 난수 하나. 효과도 이것만 쓴다"""
     winner: str | None
+    log: list[LogEntry]
+    """UI 연출용 기록 (game/core/log.py 참고)"""
 
     @classmethod
     def new(
@@ -29,174 +39,165 @@ class Game:
         die_id: str,
         start_coins: int = 0,
     ) -> Game:
-        """새 게임을 만들고 턴 루프를 시작함
-        # 1) players: (pid, nickname) 2~4개.
-        # 2) 모든 플레이어가 die_id 템플릿으로 만든 주사위를 받음
-        # 3) seed는 호스트가 정해서 모든 피어에 같은 값을 줘야 함"""
-        game_instance = cls()
-        game_instance.rng = Rng(seed)
-        game_instance.board = BOARDS[board_id]()
-
-        game_instance.players = [
-            Player(
-                pid=player_id,
-                nickname=player_nickname,
-                coins=start_coins,
-                pos=0,
-                die=Die(die_id, sides=[], effects=[]),
-            )
-            for player_id, player_nickname in players
+        g = cls()
+        g.rng = Rng(seed)
+        g.board = BOARDS[board_id]()
+        g.players = [
+            Player(pid=pid, nickname=nickname, coins=start_coins, pos=0, die=DICE[die_id]())
+            for pid, nickname in players
         ]
+        g.turn = 1
+        g.current = 0
+        g.winner = None
+        g.log = []
+        g._start_turn()
+        return g
 
-        game_instance.turn = 1
-        game_instance.current = 0
-        game_instance.phase = Phase.ROLL
-        game_instance.winner = None
-        return game_instance
-
-    def current_player(self) -> Player:  # 추가한 def
+    def current_player(self) -> Player:
         return self.players[self.current]
 
     def add_coins(self, p: Player, amount: int) -> None:
-        """그 플레이어의 코인 증가/감소. 0 미만으로 감소하지 않음"""
+        """코인 증감. 0 미만으로 내려가지 않는다."""
+        before = p.coins
         p.coins = max(p.coins + amount, 0)
+        if p.coins != before:
+            self.add_log("coins", p, delta=p.coins - before, total=p.coins)
 
     def move(self, p: Player, steps: int, is_teleport: bool = False) -> None:
-        """steps칸 전진 (steps <= 0이면 바로 return)
+        """steps칸 전진. steps <= 0이면 아무 일 없음.
 
-        한 칸씩 pos += 1 하면서 이하 효과 :
-        1) 그 칸이 goal이면 win(p) 후 아무것도 안 보고 즉시 return
-        2) 마지막 칸이 아니고 is_teleport가 아니라면 p의 효과들 on_pass(tile)
-        3) 마지막 칸이면 p의 효과들 on_land(tile), 그다음 그 칸 TileKind.on_land 호출
+        한 칸씩 전진하면서
+        1) goal에 닿으면 즉시 승리 (훅 없음)
+        2) 마지막 칸이 아니고 순간이동이 아니면 효과들 on_pass
+        끝나면 도착 처리: 효과들 on_land → 그 칸 TileKind.on_land
         """
         if steps <= 0:
             return
-
+        start = p.pos
         for i in range(steps):
             p.pos += 1
-
-            is_last_tile = i == steps - 1  # i 활용하는 방식으로 수정
-
             if p.pos >= self.board.goal:
-                p.pos = self.board.goal  # 이 부분도 수정
-                break
-
-            current_tile = self.board.get_tile(
-                p.pos
-            )  # state.py에서 Board 클래스에 get_tile정의 필요할듯
-
-            if not is_last_tile and not is_teleport:
-                for effect in p.effects:
-                    effect.on_pass(self, p, current_tile)
-
-        """final_tile = self.board.get_tile(p.pos) 의 부분"""
-
-        """for effect in p.effects: #플레이어의 특수 이펙트들 중 effect로 해서 for 하려고 했으나 TODO
-        effect.on_land(self, p, final_tile)
-        """
-
-        if p.pos == self.board.goal:
-            self.win(p)
-        else:
-            final_tile = self.board.get_tile(p.pos)  # 로 이동하였으나 오류 그대로
-            final_tile.kind.on_land(self, p)
+                p.pos = self.board.goal
+                self.add_log("moved", p, start=start, end=p.pos, teleport=int(is_teleport))
+                self.win(p)
+                return
+            if i < steps - 1 and not is_teleport:
+                for effect in p.die.effects:
+                    effect.on_pass(self, p, p.pos)
+                if self.winner is not None:
+                    return
+        self.add_log("moved", p, start=start, end=p.pos, teleport=int(is_teleport))
+        self._land(p)
 
     def replace_die(self, p: Player, die_id: str) -> None:
-        """die_id 템플릿으로 새 주사위를 만들어 교체함"""
-        new_die = Die(die_id, sides=[], effects=[])  # 일단 new_die로 잡았어요
-        p.die = new_die
+        """die_id 주사위로 통째로 교체. 옛 주사위 효과의 기록은 사라진다."""
+        p.die = DICE[die_id]()
+        self.add_log("die_replaced", p, die=die_id)
+
+    def add_log(self, kind: str, p: Player | None = None, **data: int | str) -> None:
+        """UI용 기록 추가. 효과가 자기 연출용 기록을 남길 때도 쓴다."""
+        self.log.append(LogEntry(kind, p.pid if p is not None else None, dict(data)))
 
     def legal_actions(self, pid: str) -> list[Action]:
-        """pid가 지금 보낼 수 있는 Action 목록 리턴
+        """pid가 지금 보낼 수 있는 Action 전부. UI는 이 순서대로 버튼을 놓는다.
 
-        지금 턴을 가진 플레이어가 아니면 빈 배열 리턴
-        아니라면, phase에 따라 이하의 배열 리턴
-        ROLL) RollDice + UseActive들
-        ACTION) UseActive들 + EndTurn
-        END) []
+        내 턴이 아니거나 게임이 끝났으면 []
+        ROLL: RollDice, UseActive들
+        ACTION: UseActive들, Buy들, EndTurn
         """
-        current_player = self.current_player()
-        if current_player.pid != pid:
+        p = self.current_player()
+        if p.pid != pid or self.phase == Phase.END:
             return []
-
-        actions: list[Action] = []  # actions = [] 의미. Action 계열 데이터 모아둘 리스트 명시했어요
-        phase = self.phase
-
-        if phase == Phase.ROLL:  # ROLL 페이즈
-            actions.append(RollDice(current_player.pid))
-            if current_player.die and current_player.die.effects:
-                for effect_index, effect in enumerate(
-                    current_player.die.effects
-                ):  # enumerate추가 수정
-                    actions.append(UseActive(current_player.pid, effect_index))
-
-        elif phase == Phase.ACTION:  # ACTION 페이즈
-            if current_player.die and current_player.die.effects:
-                for effect in current_player.die.effects:
-                    actions.append(UseActive(effect))
-            actions.append(EndTurn(current_player.pid))
-
-        elif phase == Phase.END:  # END 페이즈 [] 반환
-            return []
-
+        actions: list[Action] = []
+        if self.phase == Phase.ROLL:
+            actions.append(RollDice(pid))
+        for i, effect in enumerate(p.die.effects):
+            for target in effect.targets(self, p):
+                actions.append(UseActive(pid, i, target))
+        if self.phase == Phase.ACTION:
+            for die_id, price in SHOP.items():
+                if die_id != p.die.id and p.coins >= price:
+                    actions.append(Buy(pid, die_id))
+            actions.append(EndTurn(pid))
         return actions
 
     def apply(self, action: Action) -> None:
-        """Action 하나를 처리함
+        """Action 하나를 끝까지 처리한다. legal_actions에 없으면 illegalaction"""
+        if action not in self.legal_actions(action.pid):
+            raise IllegalAction(action)
+        p = self.current_player()
 
-        RollDice
-        1) 주사위의 면 하나를 랜덤하게 고름
-        2) 주사위의 면 값을 die.effects에서 그 면의 effects에 우선순위 순서대로 modify_roll에 통과시킨 값을 얻음
-        3) 그 값만큼 move 호출
-        UseActive
-        1) die.effects[effect_index].use(self, p, target)
-        EndTurn:
-        1) 그 플레이어가 가진 모든 효과들 on_turn_end 호출
-        2) 다음 플레이어로 턴 넘김
-        """
-        p = self.players[self.current]
-
-        if isinstance(action, RollDice):  # RollDice 액션 처리
+        if isinstance(action, RollDice):
             side = self.rng.choice(p.die.sides)
             value = side.value
-
-            """ 모든 효과 리스트, 주사위 자체/선택 면 효과 추가. 우선순위 부분 - 시스템적으로 더 필요하다 함. TODO
-            all_effects = []
-            if p.die and p.die.effects:
-                all_effects.extend(p.die.effects)
-            if side and side.effects:
-                all_effects.extend(side.effects)
-
-            .sort() key 어떨지 모름
-            이 부분 통째로 수정 가능
-
-
-            for effect in all_effects:
+            for effect in p.die.effects + side.effects:  # 주사위 효과 → 나온 면 효과 순
                 value = effect.modify_roll(self, p, value)
-            """
-            self.move(p, value)
-            self.phase = Phase.ACTION
+            self.add_log("rolled", p, face=side.value, value=value)
+            self.move(p, max(0, value))
+            if self.winner is None:
+                self.phase = Phase.ACTION
 
-        elif isinstance(action, UseActive):  # UseActive 액션 처리
-            if p.die and p.die.effects and 0 <= action.effect_index < len(p.die.effects):
-                p.die.effects[action.effect_index].use(self, p, action.target)
+        elif isinstance(action, UseActive):
+            effect = p.die.effects[action.effect_index]
+            self.add_log("used", p, effect=effect.id)
+            effect.use(self, p, action.target)
 
-        elif isinstance(action, EndTurn):  # EndTurn 액션 처리
-            if p.die and p.die.effects:
-                for effect in p.die.effects:
-                    effect.on_turn_end(self, p)
+        elif isinstance(action, Buy):
+            price = SHOP[action.die_id]
+            self.add_coins(p, -price)
+            self.replace_die(p, action.die_id)
+            self.add_log("bought", p, die=action.die_id, price=price)
 
+        elif isinstance(action, EndTurn):
+            for effect in p.die.effects:
+                effect.on_turn_end(self, p)
+            self.add_log("turn_end", p, turn=self.turn)
             self.current = (self.current + 1) % len(self.players)
-
             if self.current == 0:
                 self.turn += 1
+            self._start_turn()
 
-            self.phase = Phase.ROLL
+    def state_hash(self) -> str:
+        """상태가 같은지 확인ㄴ만 함"""
+        players: list[object] = []
+        for p in self.players:
+            effects = [[e.id, e.params, e.state] for e in p.die.effects]
+            for side in p.die.sides:
+                effects += [[e.id, e.params, e.state] for e in side.effects]
+            players.append(
+                {"pid": p.pid, "coins": p.coins, "pos": p.pos, "die": p.die.id, "effects": effects}
+            )
+        data = {
+            "turn": self.turn,
+            "current": self.current,
+            "phase": self.phase.value,
+            "rng": self.rng.state,
+            "winner": self.winner,
+            "players": players,
+        }
+        raw = json.dumps(data, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     # ── 내부 ──
 
+    def _start_turn(self) -> None:
+        self.phase = Phase.ROLL
+        p = self.current_player()
+        self.add_log("turn_start", p, turn=self.turn)
+        for effect in p.die.effects:
+            effect.on_turn_start(self, p)
+
+    def _land(self, p: Player) -> None:
+        self.add_log("landed", p, tile=p.pos)
+        for effect in p.die.effects:
+            effect.on_land(self, p, p.pos)
+        if self.winner is not None:
+            return
+        tile = self.board.tiles[p.pos]
+        TILE_KINDS[tile.kind].on_land(self, p)
+
     def win(self, p: Player) -> None:
-        """게임 끝 처리"""
-        """이긴 거 그냥 .winner로 처리? - ui """
+        """승리 처리. 이거 이후에 모든 action을 무시해야 함"""
+        self.winner = p.pid
         self.phase = Phase.END
-        """승리하면 뭐 따로 출력 있는지.. - ui """
+        self.add_log("win", p)

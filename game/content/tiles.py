@@ -1,8 +1,14 @@
 """칸 종류"""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from game.core.effect import TileKind
-from game.core.game import Game
 from game.core.state import Player
+
+if TYPE_CHECKING:
+    from game.core.game import Game
 
 
 class NormalTile(TileKind):
