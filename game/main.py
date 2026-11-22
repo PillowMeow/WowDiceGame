@@ -1,18 +1,68 @@
-"""실행
-방장: uv run python -m game.main host 닉네임 인원수
-참가: uv run python -m game.main join 닉네임 방장IP
-(한 컴퓨터에서 시험할 때는 터미널 두 개로 host와 join 닉네임 127.0.0.1)
-"""
+# python -m game.main host p1 2
+# python -m game.main join p2 127.0.0.1
+import sys
+import time
+
+from game.core.actions import Action, Buy, EndTurn, RollDice, UseActive
+from game.core.game import Game, IllegalAction
+from game.network import Guest, Host
+
+
+def describe(game: Game, action: Action) -> str:
+    if isinstance(action, RollDice):
+        return "주사위 굴리기"
+    if isinstance(action, EndTurn):
+        return "턴 엔드"
+    if isinstance(action, Buy):
+        return f"{action.die_id} 업그레이드"
+    if isinstance(action, UseActive):
+        effect = game.current_player().die.effects[action.effect_index]
+        return f"{effect.name} 효과 사용"
+    return str(action)
+
+
+def print_state(game: Game) -> None:
+    for p in game.players:
+        print(f"  {p.nickname} / {p.pos}번 칸 / 코인 {p.coins} / 주사위 {p.die.id}")
 
 
 def main() -> None:
-    """1. sys.argv를 보고 Host 또는 Guest를 만든다
-    2. Game.new(net.seed, net.players, "basic", "basic_d6", start_coins=3)
-    3. 반복:
-       - net.receive()로 받은 행동을 순서대로 game.apply (IllegalAction이면 무시)
-       - 화면을 그리고 버튼이 눌렸으면 net.send (TODO)
-    """
-    raise NotImplementedError
+    net: Host | Guest
+    if sys.argv[1] == "host":
+        net = Host(sys.argv[2], int(sys.argv[3]))
+    else:
+        net = Guest(sys.argv[2], sys.argv[3])
+
+    game = Game.new(net.seed, net.players, "basic", "basic_d6", start_coins=3)
+    waiting = False
+
+    while True:
+        received = net.receive()
+        for action in received:
+            try:
+                game.apply(action)
+            except IllegalAction:
+                pass
+        if received:
+            waiting = False
+
+        if game.winner is not None:
+            print(f"{game.winner} 승리")
+            break
+
+        actions = game.legal_actions(net.my_pid)
+        if not actions or waiting:
+            time.sleep(0.1)
+            continue
+
+        print_state(game)
+        for i, action in enumerate(actions):
+            print(f"{i}: {describe(game, action)}")
+        text = input("번호")
+        if not text.isdigit() or int(text) >= len(actions):
+            continue
+        net.send(actions[int(text)])
+        waiting = True
 
 
 if __name__ == "__main__":
