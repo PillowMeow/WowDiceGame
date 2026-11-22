@@ -3,7 +3,9 @@
 host 모든 플레이어의 행동을 모아서 같은 순서로 전원에게 다시 보내는 구조
 """
 
-from multiprocessing.connection import Client
+import random
+from multiprocessing.connection import Client, Listener
+from typing import Any
 
 from game.core.actions import Action
 
@@ -24,16 +26,49 @@ class Host:
         2. player_count명이 될 때까지 accept → 닉네임 recv. 방장은 p1, 들어온 순서대로 p2, p3로 할당
         3. random.getrandbits(63)를 호출해 seed를 정하고 각 참가자에게 (pid, seed, players)를 send함
         """
-        raise NotImplementedError
+        self.my_pid = "p1"
+        self.players = [(self.my_pid, name)]
+        self.guest_conns: list[Any] = []
+        self.pending_actions: list[Action] = []
+
+        listener = Listener(("", PORT), authkey=KEY)
+
+        while len(self.players) < player_count:
+            conn = listener.accept()
+            nickname = conn.recv()
+
+            new_pid = "p" + str(len(self.players) + 1)
+            self.players.append((new_pid, nickname))
+            self.guest_conns.append(conn)
+
+        listener.close()
+
+        self.seed = random.getrandbits(63)
+
+        for i in range(len(self.guest_conns)):
+            conn = self.guest_conns[i]
+            guest_pid = self.players[i + 1][0]
+            conn.send((guest_pid, self.seed, self.players))
 
     def send(self, action: Action) -> None:
         """방장 자신의 행동. 바로 보내지 말고 대기 목록에 넣어둔다"""
-        raise NotImplementedError
+        self.pending_actions.append(action)
 
     def receive(self) -> list[Action]:
         """참가자들이 보낸 행동을 poll/recv로 모아 대기 목록에 더하고,
         대기 목록 전체를 모든 참가자에게 send한 뒤 반환함"""
-        raise NotImplementedError
+        for conn in self.guest_conns:
+            while conn.poll():
+                action = conn.recv()
+                self.pending_actions.append(action)
+
+        actions_to_send = self.pending_actions
+        self.pending_actions = []
+
+        if len(actions_to_send) > 0:
+            for conn in self.guest_conns:
+                conn.send(actions_to_send)
+        return actions_to_send
 
 
 class Guest:
