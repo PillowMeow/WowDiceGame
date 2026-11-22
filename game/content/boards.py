@@ -1,7 +1,7 @@
 from game.core.state import Board, Tile
 
 
-# 예시 보스
+# 예시 보드
 def basic_board() -> Board:
     tiles: list[Tile] = []
     for i in range(30):

@@ -4,7 +4,7 @@ host 모든 플레이어의 행동을 모아서 같은 순서로 전원에게 �
 """
 
 import random
-from multiprocessing.connection import Client, Listener
+from multiprocessing.connection import Client, Connection, Listener, PipeConnection
 from typing import Any
 
 from game.core.actions import Action
@@ -28,7 +28,7 @@ class Host:
         """
         self.my_pid = "p1"
         self.players = [(self.my_pid, name)]
-        self.guest_conns: list[Any] = []
+        self.guest_conns: list[Connection[Any, Any] | PipeConnection[Any, Any]] = []
         self.pending_actions: list[Action] = []
 
         listener = Listener(("", PORT), authkey=KEY)
@@ -67,7 +67,8 @@ class Host:
 
         if len(actions_to_send) > 0:
             for conn in self.guest_conns:
-                conn.send(actions_to_send)
+                for action in actions_to_send:
+                    conn.send(action)
         return actions_to_send
 
 
